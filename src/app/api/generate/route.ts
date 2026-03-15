@@ -6,6 +6,10 @@ const MAX_POLL_TIME = 120_000
 export async function POST(req: NextRequest) {
   const { prompt } = await req.json()
 
+  if (!prompt || typeof prompt !== "string" || prompt.length > 2000) {
+    return NextResponse.json({ error: "invalid prompt" }, { status: 400 })
+  }
+
   const apiKey = process.env.AI_IMAGE_API_KEY
   const apiBase = process.env.AI_IMAGE_API_BASE || "https://api.atlascloud.ai/api/v1"
   const model = process.env.AI_IMAGE_MODEL || "google/nano-banana/text-to-image"
@@ -86,7 +90,15 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
       headers: { Authorization: `Bearer ${apiKey}` },
     })
 
-    if (!pollRes.ok) continue
+    if (!pollRes.ok) {
+      if (pollRes.status >= 400 && pollRes.status < 500) {
+        return NextResponse.json(
+          { error: `API error: ${pollRes.status} ${pollRes.statusText}` },
+          { status: pollRes.status }
+        )
+      }
+      continue
+    }
 
     const pollRaw = await pollRes.json()
     const pollData = (pollRaw.data && typeof pollRaw.data === "object" && !Array.isArray(pollRaw.data))
