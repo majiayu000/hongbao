@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const body: Record<string, unknown> = {
+  const requestBody: Record<string, unknown> = {
     model,
     prompt,
     aspect_ratio: "3:4",
@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(requestBody),
     })
 
     if (!res.ok) {
