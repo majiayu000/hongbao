@@ -21,11 +21,17 @@ vi.mock("next/server", () => ({
 const { NextRequest } = await import("next/server")
 const { POST } = await import("./route")
 
+type MockResponse = { _status: number; _data: unknown; json: () => Promise<unknown>; status: number }
+
 function makeRequest(body: unknown) {
   return new NextRequest("http://localhost/api/generate", {
     method: "POST",
     body: JSON.stringify(body),
   })
+}
+
+function asMock(res: unknown): MockResponse {
+  return res as MockResponse
 }
 
 describe("POST /api/generate — input validation", () => {
@@ -35,23 +41,23 @@ describe("POST /api/generate — input validation", () => {
   })
 
   it("returns 400 when prompt is missing", async () => {
-    const res = await POST(makeRequest({}))
+    const res = asMock(await POST(makeRequest({})))
     expect(res._status).toBe(400)
     expect((res._data as { error: string }).error).toMatch(/非空字符串/)
   })
 
   it("returns 400 when prompt is not a string", async () => {
-    const res = await POST(makeRequest({ prompt: 123 }))
+    const res = asMock(await POST(makeRequest({ prompt: 123 })))
     expect(res._status).toBe(400)
   })
 
   it("returns 400 when prompt is empty string", async () => {
-    const res = await POST(makeRequest({ prompt: "   " }))
+    const res = asMock(await POST(makeRequest({ prompt: "   " })))
     expect(res._status).toBe(400)
   })
 
   it("returns 400 when prompt exceeds 2000 characters", async () => {
-    const res = await POST(makeRequest({ prompt: "a".repeat(2001) }))
+    const res = asMock(await POST(makeRequest({ prompt: "a".repeat(2001) })))
     expect(res._status).toBe(400)
     expect((res._data as { error: string }).error).toMatch(/2000/)
   })
@@ -63,7 +69,7 @@ describe("POST /api/generate — input validation", () => {
       text: () => Promise.resolve("error"),
     })
     vi.stubGlobal("fetch", fetchMock)
-    const res = await POST(makeRequest({ prompt: "a".repeat(2000) }))
+    const res = asMock(await POST(makeRequest({ prompt: "a".repeat(2000) })))
     expect(res._status).not.toBe(400)
   })
 })
@@ -90,7 +96,7 @@ describe("POST /api/generate — polling 4xx error handling", () => {
       })
     vi.stubGlobal("fetch", fetchMock)
 
-    const res = await POST(makeRequest({ prompt: "test prompt" }))
+    const res = asMock(await POST(makeRequest({ prompt: "test prompt" })))
     expect(res._status).toBe(429)
     expect((res._data as { error: string }).error).toMatch(/频繁/)
   })
@@ -109,7 +115,7 @@ describe("POST /api/generate — polling 4xx error handling", () => {
       })
     vi.stubGlobal("fetch", fetchMock)
 
-    const res = await POST(makeRequest({ prompt: "test prompt" }))
+    const res = asMock(await POST(makeRequest({ prompt: "test prompt" })))
     expect(res._status).toBe(401)
     expect((res._data as { error: string }).error).toMatch(/认证/)
   })
