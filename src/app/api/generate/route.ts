@@ -4,7 +4,15 @@ const POLL_INTERVAL = 2000
 const MAX_POLL_TIME = 120_000
 
 export async function POST(req: NextRequest) {
-  const { prompt } = await req.json()
+  const body = await req.json()
+  const { prompt } = body
+
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    return NextResponse.json({ error: "prompt 必须为非空字符串" }, { status: 400 })
+  }
+  if (prompt.length > 2000) {
+    return NextResponse.json({ error: "prompt 不能超过 2000 字符" }, { status: 400 })
+  }
 
   const apiKey = process.env.AI_IMAGE_API_KEY
   const apiBase = process.env.AI_IMAGE_API_BASE || "https://api.atlascloud.ai/api/v1"
@@ -86,7 +94,15 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
       headers: { Authorization: `Bearer ${apiKey}` },
     })
 
-    if (!pollRes.ok) continue
+    if (!pollRes.ok) {
+      if (pollRes.status === 429) {
+        return NextResponse.json({ error: "请求过于频繁，请稍后重试" }, { status: 429 })
+      }
+      if (pollRes.status === 401) {
+        return NextResponse.json({ error: "API 认证失败，请检查密钥配置" }, { status: 401 })
+      }
+      continue
+    }
 
     const pollRaw = await pollRes.json()
     const pollData = (pollRaw.data && typeof pollRaw.data === "object" && !Array.isArray(pollRaw.data))
