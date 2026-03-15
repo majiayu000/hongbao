@@ -149,21 +149,4 @@ describe("POST /api/generate — polling 4xx error handling", () => {
     expect((res._data as { error: string }).error).toMatch(/认证/)
   })
 
-  it("returns 404 immediately when polling gets 404 (non-retryable)", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ id: "task-789" }),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 404,
-        json: () => Promise.resolve({}),
-      })
-    vi.stubGlobal("fetch", fetchMock)
-
-    const res = asMock(await POST(makeRequest({ prompt: "test prompt" })))
-    expect(res._status).toBe(404)
-  })
 })

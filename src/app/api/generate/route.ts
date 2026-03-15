@@ -110,13 +110,6 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
       if (pollRes.status === 401) {
         return NextResponse.json({ error: "API 认证失败，请检查密钥配置" }, { status: 401 })
       }
-      // 其他 4xx 是客户端错误，不可重试，直接返回
-      if (pollRes.status >= 400 && pollRes.status < 500) {
-        return NextResponse.json(
-          { error: `轮询请求失败: ${pollRes.status}` },
-          { status: pollRes.status }
-        )
-      }
       continue
     }
 
