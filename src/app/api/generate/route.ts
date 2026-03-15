@@ -4,16 +4,6 @@ const POLL_INTERVAL = 2000
 const MAX_POLL_TIME = 120_000
 
 export async function POST(req: NextRequest) {
-  const body = await req.json()
-  const { prompt } = body
-
-  if (typeof prompt !== "string" || prompt.trim().length === 0) {
-    return NextResponse.json({ error: "prompt 必须为非空字符串" }, { status: 400 })
-  }
-  if (prompt.length > 2000) {
-    return NextResponse.json({ error: "prompt 不能超过 2000 字符" }, { status: 400 })
-  }
-
   const apiKey = process.env.AI_IMAGE_API_KEY
   const apiBase = process.env.AI_IMAGE_API_BASE || "https://api.atlascloud.ai/api/v1"
   const model = process.env.AI_IMAGE_MODEL || "google/nano-banana/text-to-image"
@@ -25,15 +15,34 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const requestBody: Record<string, unknown> = {
-    model,
-    prompt,
-    aspect_ratio: "3:4",
-    output_format: "png",
-    enable_sync_mode: true,
-  }
-
   try {
+    let body: unknown
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: "请求体必须为有效 JSON" }, { status: 400 })
+    }
+
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return NextResponse.json({ error: "请求体必须为 JSON 对象" }, { status: 400 })
+    }
+
+    const { prompt } = body as Record<string, unknown>
+
+    if (typeof prompt !== "string" || prompt.trim().length === 0) {
+      return NextResponse.json({ error: "prompt 必须为非空字符串" }, { status: 400 })
+    }
+    if (prompt.length > 2000) {
+      return NextResponse.json({ error: "prompt 不能超过 2000 字符" }, { status: 400 })
+    }
+
+    const requestBody: Record<string, unknown> = {
+      model,
+      prompt,
+      aspect_ratio: "3:4",
+      output_format: "png",
+      enable_sync_mode: true,
+    }
     const res = await fetch(`${apiBase}/model/generateImage`, {
       method: "POST",
       headers: {
@@ -100,6 +109,13 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
       }
       if (pollRes.status === 401) {
         return NextResponse.json({ error: "API 认证失败，请检查密钥配置" }, { status: 401 })
+      }
+      // 其他 4xx 是客户端错误，不可重试，直接返回
+      if (pollRes.status >= 400 && pollRes.status < 500) {
+        return NextResponse.json(
+          { error: `轮询请求失败: ${pollRes.status}` },
+          { status: pollRes.status }
+        )
       }
       continue
     }

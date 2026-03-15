@@ -74,6 +74,35 @@ describe("POST /api/generate — input validation", () => {
   })
 })
 
+describe("POST /api/generate — malformed request body", () => {
+  beforeEach(() => {
+    vi.stubEnv("AI_IMAGE_API_KEY", "test-key")
+    vi.stubEnv("AI_IMAGE_API_BASE", "https://api.test.local")
+  })
+
+  it("returns 400 when body is null JSON", async () => {
+    const res = asMock(await POST(makeRequest(null)))
+    expect(res._status).toBe(400)
+  })
+
+  it("returns 400 when body is a JSON array", async () => {
+    const res = asMock(await POST(makeRequest(["foo"])))
+    expect(res._status).toBe(400)
+  })
+
+  it("returns 400 when body is malformed JSON", async () => {
+    const { NextRequest: NR } = await import("next/server")
+    // Bypass makeRequest to inject raw invalid JSON string
+    const req = new NR("http://localhost/api/generate", {
+      method: "POST",
+      body: "not valid json",
+    })
+    const res = asMock(await POST(req))
+    expect(res._status).toBe(400)
+    expect((res._data as { error: string }).error).toMatch(/JSON/)
+  })
+})
+
 describe("POST /api/generate — polling 4xx error handling", () => {
   beforeEach(() => {
     vi.stubEnv("AI_IMAGE_API_KEY", "test-key")
@@ -118,5 +147,23 @@ describe("POST /api/generate — polling 4xx error handling", () => {
     const res = asMock(await POST(makeRequest({ prompt: "test prompt" })))
     expect(res._status).toBe(401)
     expect((res._data as { error: string }).error).toMatch(/认证/)
+  })
+
+  it("returns 404 immediately when polling gets 404 (non-retryable)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ id: "task-789" }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({}),
+      })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const res = asMock(await POST(makeRequest({ prompt: "test prompt" })))
+    expect(res._status).toBe(404)
   })
 })
