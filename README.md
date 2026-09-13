@@ -49,12 +49,22 @@ npm install
 pip install httpx pillow python-dotenv google-genai
 ```
 
-### 2. 配置 API Key
+### 2. 配置 API Key 与生成访问令牌
 
 ```bash
 cp env.example .env.local
-# 编辑 .env.local，填入你的 AtlasCloud API Key
+# 编辑 .env.local：
+# - AI_IMAGE_API_KEY：AtlasCloud 上游密钥（仅服务端）
+# - GENERATE_ACCESS_TOKEN：服务端校验的共享密钥（必填，否则 /api/generate 返回 503）
+# - NEXT_PUBLIC_GENERATE_ACCESS_TOKEN：前端请求时带上的同一密钥
 ```
+
+`POST /api/generate` 在调用 AtlasCloud 之前会：
+
+1. 校验 `Authorization: Bearer …` 或 `x-generate-token` 是否与 `GENERATE_ACCESS_TOKEN` 一致（失败 → 401）
+2. 按客户端 IP 做内存限流与每日配额（超限 → 429）
+
+默认约每分钟 5 次、每天 20 次，可用 `GENERATE_RATE_LIMIT` / `GENERATE_RATE_WINDOW_MS` / `GENERATE_DAILY_QUOTA` 调整。
 
 ### 3. 生成底图
 

@@ -1,9 +1,20 @@
 import { NextRequest, NextResponse } from "next/server"
+import {
+  assertGenerateAccess,
+  assertGenerateQuota,
+} from "@/lib/generate-guard"
 
 const POLL_INTERVAL = 2000
 const MAX_POLL_TIME = 120_000
 
 export async function POST(req: NextRequest) {
+  // Auth + quota before parsing body or calling AtlasCloud
+  const denied = assertGenerateAccess(req)
+  if (denied) return denied
+
+  const limited = assertGenerateQuota(req)
+  if (limited) return limited
+
   const { prompt } = await req.json()
 
   if (!prompt || typeof prompt !== "string" || prompt.length > 2000) {

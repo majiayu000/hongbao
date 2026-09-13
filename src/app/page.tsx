@@ -28,9 +28,18 @@ export default function HomePage() {
     const prompt = customPrompt || buildPrompt(theme, text)
 
     try {
+      const generateToken = process.env.NEXT_PUBLIC_GENERATE_ACCESS_TOKEN
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      }
+      if (generateToken) {
+        headers.Authorization = `Bearer ${generateToken}`
+        headers["x-generate-token"] = generateToken
+      }
+
       const res = await fetch("/api/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ prompt }),
       })
       const data = await res.json()
