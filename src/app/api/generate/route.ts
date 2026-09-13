@@ -94,6 +94,11 @@ export async function POST(req: NextRequest) {
       return timeoutResponse(taskId)
     }
     console.error("Generate image error:", err)
+    // After create assigned a taskId, preserve it so the UI can resume instead of
+    // treating a transient poll/network failure as a terminal 500.
+    if (taskId) {
+      return timeoutResponse(taskId)
+    }
     return NextResponse.json(
       { error: "网络错误，请重试" },
       { status: 500 }
@@ -141,10 +146,8 @@ export async function GET(req: NextRequest) {
       return timeoutResponse(taskId)
     }
     console.error("Resume prediction error:", err)
-    return NextResponse.json(
-      { error: "网络错误，请重试" },
-      { status: 500 }
-    )
+    // GET always has a validated taskId; keep transient poll failures recoverable.
+    return timeoutResponse(taskId)
   } finally {
     cleanup()
   }
