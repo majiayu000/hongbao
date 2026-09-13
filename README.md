@@ -55,14 +55,17 @@ pip install httpx pillow python-dotenv google-genai
 cp env.example .env.local
 # 编辑 .env.local：
 # - AI_IMAGE_API_KEY：AtlasCloud 上游密钥（仅服务端）
-# - GENERATE_ACCESS_TOKEN：服务端校验的共享密钥（必填，否则 /api/generate 返回 503）
-# - NEXT_PUBLIC_GENERATE_ACCESS_TOKEN：前端请求时带上的同一密钥
+# - GENERATE_ACCESS_TOKEN：服务端共享密钥（必填；不要使用 NEXT_PUBLIC_ 前缀）
+# - 多实例/serverless：配置 Upstash Redis，并建议开启 GENERATE_REQUIRE_SHARED_QUOTA=1
+# - 反代部署：设置 GENERATE_TRUSTED_PROXY_HOPS 为可信代理层数（默认 0，忽略客户端 XFF）
 ```
 
 `POST /api/generate` 在调用 AtlasCloud 之前会：
 
-1. 校验 `Authorization: Bearer …` 或 `x-generate-token` 是否与 `GENERATE_ACCESS_TOKEN` 一致（失败 → 401）
-2. 按客户端 IP 做内存限流与每日配额（超限 → 429）
+1. 校验访问：`Authorization: Bearer …` / `x-generate-token`，或由 `POST /api/auth` 签发的 **httpOnly** 会话 cookie（失败 → 401）
+2. 按客户端 IP 做突发限流与每日配额（超限 → 429）；生产多实例请用 Redis 共享存储
+
+Web UI 解锁时由用户粘贴令牌换取会话 cookie，**密钥不会打进前端 JS 包**。
 
 默认约每分钟 5 次、每天 20 次，可用 `GENERATE_RATE_LIMIT` / `GENERATE_RATE_WINDOW_MS` / `GENERATE_DAILY_QUOTA` 调整。
 

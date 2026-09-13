@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
   const denied = assertGenerateAccess(req)
   if (denied) return denied
 
-  const limited = assertGenerateQuota(req)
+  const limited = await assertGenerateQuota(req)
   if (limited) return limited
 
   const { prompt } = await req.json()

@@ -1,7 +1,7 @@
 "use client"
 
-import { useState, useCallback } from "react"
-import { Download, Loader2, Sparkles, RotateCw } from "lucide-react"
+import { useState, useCallback, useEffect } from "react"
+import { Download, Loader2, Sparkles, RotateCw, Lock } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
@@ -15,11 +15,57 @@ export default function HomePage() {
   const [images, setImages] = useState<string[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [unlocked, setUnlocked] = useState(false)
+  const [authChecking, setAuthChecking] = useState(true)
+  const [accessToken, setAccessToken] = useState("")
+  const [unlocking, setUnlocking] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch("/api/auth", { method: "GET" })
+        const data = await res.json()
+        if (!cancelled) setUnlocked(Boolean(data.unlocked))
+      } catch {
+        if (!cancelled) setUnlocked(false)
+      } finally {
+        if (!cancelled) setAuthChecking(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const handleThemeChange = (t: ThemeOption) => {
     setTheme(t)
     setText(t.defaultText)
   }
+
+  const unlock = useCallback(async () => {
+    setUnlocking(true)
+    setError(null)
+    try {
+      const res = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: accessToken }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || "解锁失败")
+        setUnlocked(false)
+        return
+      }
+      setUnlocked(true)
+      setAccessToken("")
+    } catch {
+      setError("网络错误，请重试")
+    } finally {
+      setUnlocking(false)
+    }
+  }, [accessToken])
 
   const generate = useCallback(async () => {
     setLoading(true)
@@ -28,23 +74,19 @@ export default function HomePage() {
     const prompt = customPrompt || buildPrompt(theme, text)
 
     try {
-      const generateToken = process.env.NEXT_PUBLIC_GENERATE_ACCESS_TOKEN
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      }
-      if (generateToken) {
-        headers.Authorization = `Bearer ${generateToken}`
-        headers["x-generate-token"] = generateToken
-      }
-
+      // Credential stays server-side via httpOnly session cookie from /api/auth.
+      // Never embed GENERATE_ACCESS_TOKEN in the client bundle.
       const res = await fetch("/api/generate", {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt }),
       })
       const data = await res.json()
 
       if (!res.ok) {
+        if (res.status === 401) {
+          setUnlocked(false)
+        }
         setError(data.error)
         return
       }
@@ -78,6 +120,35 @@ export default function HomePage() {
       <div className="flex h-[calc(100vh-48px)]">
         {/* 左栏：控制 */}
         <div className="w-72 border-r border-white/10 p-4 space-y-5 overflow-y-auto flex-shrink-0">
+          {/* 会话解锁：令牌仅用于换取 httpOnly cookie，不会打进前端包 */}
+          {!authChecking && !unlocked && (
+            <section className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-950/20 p-3">
+              <label className="text-xs text-amber-200/80 flex items-center gap-1">
+                <Lock className="w-3 h-3" />
+                输入 GENERATE_ACCESS_TOKEN 解锁
+              </label>
+              <Input
+                type="password"
+                value={accessToken}
+                onChange={(e) => setAccessToken(e.target.value)}
+                placeholder="服务端共享密钥"
+                className="bg-white/5 border-white/10 text-white"
+                autoComplete="off"
+              />
+              <Button
+                onClick={unlock}
+                disabled={unlocking || !accessToken.trim()}
+                className="w-full bg-amber-600 hover:bg-amber-700 h-9"
+              >
+                {unlocking ? (
+                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" />解锁中...</>
+                ) : (
+                  "解锁生成"
+                )}
+              </Button>
+            </section>
+          )}
+
           {/* 主题 */}
           <section>
             <label className="text-xs text-white/50 mb-2 block">主题</label>
@@ -131,7 +202,7 @@ export default function HomePage() {
           {/* 生成按钮 */}
           <Button
             onClick={generate}
-            disabled={loading}
+            disabled={loading || !unlocked}
             className="w-full bg-red-600 hover:bg-red-700 h-10"
           >
             {loading ? (
@@ -154,7 +225,7 @@ export default function HomePage() {
               </Button>
               <Button
                 onClick={generate}
-                disabled={loading}
+                disabled={loading || !unlocked}
                 variant="ghost"
                 className="w-full text-white/50 hover:text-white hover:bg-white/5"
               >

@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 /** Sliding-window burst limit (requests per window). */
@@ -5,14 +6,17 @@ const DEFAULT_RATE_LIMIT = 5
 const DEFAULT_RATE_WINDOW_MS = 60_000
 /** Per-IP daily generate ceiling. */
 const DEFAULT_DAILY_QUOTA = 20
+/** Drop idle in-memory buckets after this TTL (local single-process only). */
+const DEFAULT_BUCKET_TTL_MS = 48 * 60 * 60_000
+
+const SESSION_COOKIE = "generate_session"
+const SESSION_MAX_AGE_SEC = 60 * 60 * 12
 
 type Bucket = {
-  /** Timestamps of recent requests within the rate window. */
   hits: number[]
-  /** Calendar day key (UTC YYYY-MM-DD) for daily quota. */
   day: string
-  /** Successful auth'd generate attempts counted today. */
   dayCount: number
+  lastSeen: number
 }
 
 const buckets = new Map<string, Bucket>()
@@ -27,14 +31,50 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback
+  const n = Number.parseInt(raw, 10)
+  return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ba.length !== bb.length) return false
+  return timingSafeEqual(ba, bb)
+}
+
+/** Constant-time compare for access tokens. */
+export function accessTokensMatch(provided: string, expected: string): boolean {
+  return safeEqual(provided, expected)
+}
+
+/**
+ * Client IP for quota keys.
+ *
+ * By default ignores client-controlled forwarding headers so callers cannot
+ * rotate X-Forwarded-For to mint fresh buckets. Set GENERATE_TRUSTED_PROXY_HOPS
+ * to the number of trusted proxies that append to X-Forwarded-For; the client
+ * address is taken at index (length - hops).
+ */
 export function getClientIp(req: NextRequest): string {
+  const hops = parseNonNegativeInt(process.env.GENERATE_TRUSTED_PROXY_HOPS, 0)
+  if (hops <= 0) {
+    return "unknown"
+  }
+
   const forwarded = req.headers.get("x-forwarded-for")
   if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim()
-    if (first) return first
+    const parts = forwarded
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean)
+    const idx = parts.length - hops
+    if (idx >= 0 && parts[idx]) {
+      return parts[idx]
+    }
   }
-  const realIp = req.headers.get("x-real-ip")?.trim()
-  if (realIp) return realIp
+
   return "unknown"
 }
 
@@ -51,9 +91,47 @@ export function extractAccessToken(req: NextRequest): string | null {
   return match?.[1]?.trim() || null
 }
 
+function signSessionValue(secret: string, issuedAtMs: number): string {
+  const payload = `v1.${issuedAtMs}`
+  const sig = createHmac("sha256", secret).update(payload).digest("base64url")
+  return `${payload}.${sig}`
+}
+
+export function verifySessionCookie(
+  raw: string | undefined,
+  secret: string
+): boolean {
+  if (!raw) return false
+  const match = /^v1\.(\d+)\.([A-Za-z0-9_-]+)$/.exec(raw.trim())
+  if (!match) return false
+  const issuedAtMs = Number.parseInt(match[1], 10)
+  if (!Number.isFinite(issuedAtMs)) return false
+  if (Date.now() - issuedAtMs > SESSION_MAX_AGE_SEC * 1000) return false
+  const expected = signSessionValue(secret, issuedAtMs)
+  return safeEqual(raw.trim(), expected)
+}
+
+export function createSessionCookieValue(secret: string): string {
+  return signSessionValue(secret, Date.now())
+}
+
+export function sessionCookieName(): string {
+  return SESSION_COOKIE
+}
+
+export function sessionCookieOptions(maxAge = SESSION_MAX_AGE_SEC) {
+  return {
+    httpOnly: true,
+    sameSite: "strict" as const,
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge,
+  }
+}
+
 /**
  * Reject before any upstream call when GENERATE_ACCESS_TOKEN is missing
- * or the caller does not present a matching secret.
+ * or the caller does not present a matching secret / signed session cookie.
  */
 export function assertGenerateAccess(req: NextRequest): NextResponse | null {
   const expected = process.env.GENERATE_ACCESS_TOKEN?.trim()
@@ -65,43 +143,145 @@ export function assertGenerateAccess(req: NextRequest): NextResponse | null {
   }
 
   const provided = extractAccessToken(req)
-  if (!provided || provided !== expected) {
+  if (provided && safeEqual(provided, expected)) {
+    return null
+  }
+
+  const cookie = req.cookies.get(SESSION_COOKIE)?.value
+  if (verifySessionCookie(cookie, expected)) {
+    return null
+  }
+
+  return NextResponse.json(
+    { error: "未授权：需要有效的生成访问令牌或已解锁会话" },
+    { status: 401 }
+  )
+}
+
+function redisConfig(): { url: string; token: string } | null {
+  const url = (
+    process.env.GENERATE_QUOTA_REDIS_URL ||
+    process.env.UPSTASH_REDIS_REST_URL ||
+    ""
+  ).trim()
+  const token = (
+    process.env.GENERATE_QUOTA_REDIS_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_TOKEN ||
+    ""
+  ).trim()
+  if (!url || !token) return null
+  return { url, token }
+}
+
+async function redisCommand(
+  cfg: { url: string; token: string },
+  args: Array<string | number>
+): Promise<unknown> {
+  const res = await fetch(cfg.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(args),
+  })
+  if (!res.ok) {
+    throw new Error(`quota redis HTTP ${res.status}`)
+  }
+  const payload = (await res.json()) as { result?: unknown; error?: string }
+  if (payload.error) {
+    throw new Error(`quota redis: ${payload.error}`)
+  }
+  return payload.result
+}
+
+function evictIdleBuckets(now: number, ttlMs: number): void {
+  for (const [key, bucket] of buckets) {
+    if (now - bucket.lastSeen > ttlMs) {
+      buckets.delete(key)
+    }
+  }
+}
+
+async function assertQuotaRedis(
+  ip: string,
+  rateLimit: number,
+  rateWindowMs: number,
+  dailyQuota: number,
+  cfg: { url: string; token: string }
+): Promise<NextResponse | null> {
+  const now = Date.now()
+  const day = todayKey(now)
+  const burstKey = `hongbao:gen:burst:${ip}`
+  const dayKey = `hongbao:gen:day:${day}:${ip}`
+  const member = `${now}:${Math.random().toString(36).slice(2, 10)}`
+  const windowStart = now - rateWindowMs
+
+  await redisCommand(cfg, ["ZREMRANGEBYSCORE", burstKey, 0, windowStart])
+  const burstCount = Number(await redisCommand(cfg, ["ZCARD", burstKey]))
+  if (burstCount >= rateLimit) {
     return NextResponse.json(
-      { error: "未授权：需要有效的生成访问令牌" },
-      { status: 401 }
+      { error: "请求过于频繁，请稍后再试" },
+      { status: 429 }
+    )
+  }
+
+  const dayCount = Number((await redisCommand(cfg, ["GET", dayKey])) ?? 0)
+  if (dayCount >= dailyQuota) {
+    return NextResponse.json(
+      { error: "今日生成次数已达上限" },
+      { status: 429 }
+    )
+  }
+
+  await redisCommand(cfg, ["ZADD", burstKey, now, member])
+  await redisCommand(cfg, [
+    "PEXPIRE",
+    burstKey,
+    Math.max(rateWindowMs, 1000),
+  ])
+  const nextDay = Number(await redisCommand(cfg, ["INCR", dayKey]))
+  if (nextDay === 1) {
+    // Expire shortly after UTC day end.
+    const endOfDayMs =
+      Date.parse(`${day}T23:59:59.999Z`) - now + 60_000
+    await redisCommand(cfg, [
+      "PEXPIRE",
+      dayKey,
+      Math.max(endOfDayMs, 60_000),
+    ])
+  }
+  if (nextDay > dailyQuota) {
+    return NextResponse.json(
+      { error: "今日生成次数已达上限" },
+      { status: 429 }
     )
   }
 
   return null
 }
 
-/**
- * In-memory per-IP burst rate limit + daily quota.
- * Call only after auth succeeds so anonymous traffic cannot fill buckets.
- */
-export function assertGenerateQuota(req: NextRequest): NextResponse | null {
-  const ip = getClientIp(req)
+function assertQuotaMemory(
+  ip: string,
+  rateLimit: number,
+  rateWindowMs: number,
+  dailyQuota: number
+): NextResponse | null {
   const now = Date.now()
-  const rateLimit = parsePositiveInt(
-    process.env.GENERATE_RATE_LIMIT,
-    DEFAULT_RATE_LIMIT
-  )
-  const rateWindowMs = parsePositiveInt(
-    process.env.GENERATE_RATE_WINDOW_MS,
-    DEFAULT_RATE_WINDOW_MS
-  )
-  const dailyQuota = parsePositiveInt(
-    process.env.GENERATE_DAILY_QUOTA,
-    DEFAULT_DAILY_QUOTA
-  )
   const day = todayKey(now)
+  const ttlMs = parsePositiveInt(
+    process.env.GENERATE_BUCKET_TTL_MS,
+    DEFAULT_BUCKET_TTL_MS
+  )
+  evictIdleBuckets(now, ttlMs)
 
   let bucket = buckets.get(ip)
   if (!bucket || bucket.day !== day) {
-    bucket = { hits: [], day, dayCount: 0 }
+    bucket = { hits: [], day, dayCount: 0, lastSeen: now }
     buckets.set(ip, bucket)
   }
 
+  bucket.lastSeen = now
   bucket.hits = bucket.hits.filter((t) => now - t < rateWindowMs)
 
   if (bucket.hits.length >= rateLimit) {
@@ -121,6 +301,58 @@ export function assertGenerateQuota(req: NextRequest): NextResponse | null {
   bucket.hits.push(now)
   bucket.dayCount += 1
   return null
+}
+
+/**
+ * Per-IP burst rate limit + daily quota.
+ * Prefer Redis (GENERATE_QUOTA_REDIS_URL + TOKEN / Upstash) for multi-instance.
+ * Call only after auth succeeds so anonymous traffic cannot fill buckets.
+ */
+export async function assertGenerateQuota(
+  req: NextRequest
+): Promise<NextResponse | null> {
+  const ip = getClientIp(req)
+  const rateLimit = parsePositiveInt(
+    process.env.GENERATE_RATE_LIMIT,
+    DEFAULT_RATE_LIMIT
+  )
+  const rateWindowMs = parsePositiveInt(
+    process.env.GENERATE_RATE_WINDOW_MS,
+    DEFAULT_RATE_WINDOW_MS
+  )
+  const dailyQuota = parsePositiveInt(
+    process.env.GENERATE_DAILY_QUOTA,
+    DEFAULT_DAILY_QUOTA
+  )
+
+  const redis = redisConfig()
+  const requireShared =
+    process.env.GENERATE_REQUIRE_SHARED_QUOTA === "1" ||
+    process.env.GENERATE_REQUIRE_SHARED_QUOTA === "true"
+
+  if (!redis && requireShared) {
+    return NextResponse.json(
+      {
+        error:
+          "未配置共享配额存储（GENERATE_QUOTA_REDIS_URL / UPSTASH_REDIS_REST_URL），拒绝生成",
+      },
+      { status: 503 }
+    )
+  }
+
+  if (redis) {
+    try {
+      return await assertQuotaRedis(ip, rateLimit, rateWindowMs, dailyQuota, redis)
+    } catch (err) {
+      console.error("Shared quota store error:", err)
+      return NextResponse.json(
+        { error: "配额服务暂时不可用，请稍后重试" },
+        { status: 503 }
+      )
+    }
+  }
+
+  return assertQuotaMemory(ip, rateLimit, rateWindowMs, dailyQuota)
 }
 
 /** Test helper: clear in-memory buckets between scenarios. */
