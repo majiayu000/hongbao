@@ -15,6 +15,8 @@ export default function HomePage() {
   const [images, setImages] = useState<string[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** In-flight upstream prediction to resume instead of creating a duplicate billable task. */
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null)
 
   const handleThemeChange = (t: ThemeOption) => {
     setTheme(t)
@@ -29,9 +31,34 @@ export default function HomePage() {
   /** Resume a timed-out upstream task via short GET polls (each under gateway limit). */
   const resumeTask = useCallback(async (taskId: string): Promise<string | null> => {
     const maxAttempts = 4
+    const backoff = (attempt: number) =>
+      new Promise((r) => setTimeout(r, 400 * (attempt + 1)))
+
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const res = await fetch(`/api/generate?taskId=${encodeURIComponent(taskId)}`)
-      const data = await res.json()
+      let res: Response
+      let data: { url?: unknown; taskId?: unknown; error?: unknown }
+
+      try {
+        res = await fetch(`/api/generate?taskId=${encodeURIComponent(taskId)}`)
+      } catch {
+        // Transient network failure — keep taskId and retry.
+        if (attempt < maxAttempts - 1) {
+          await backoff(attempt)
+          continue
+        }
+        throw new Error("网络错误，请重试")
+      }
+
+      try {
+        data = await res.json()
+      } catch {
+        // Non-JSON gateway/error page — keep taskId and retry.
+        if (attempt < maxAttempts - 1) {
+          await backoff(attempt)
+          continue
+        }
+        throw new Error("恢复生成任务失败（响应无效）")
+      }
 
       if (res.ok && typeof data.url === "string" && data.url) {
         return data.url
@@ -41,6 +68,7 @@ export default function HomePage() {
         continue
       }
 
+      // Terminal API response — do not create a new task; surface the error.
       throw new Error(
         typeof data.error === "string" && data.error.length > 0
           ? data.error
@@ -54,9 +82,23 @@ export default function HomePage() {
     setLoading(true)
     setError(null)
 
-    const prompt = customPrompt || buildPrompt(theme, text)
-
     try {
+      // Prefer resuming a known in-flight task over creating another billable prediction.
+      if (pendingTaskId) {
+        setError("正在恢复上游任务…")
+        const url = await resumeTask(pendingTaskId)
+        if (url) {
+          setPendingTaskId(null)
+          setError(null)
+          applyImageUrl(url)
+          return
+        }
+        setError("生成超时，请稍后重试")
+        return
+      }
+
+      const prompt = customPrompt || buildPrompt(theme, text)
+
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -71,9 +113,11 @@ export default function HomePage() {
           typeof data.taskId === "string" &&
           data.taskId.length > 0
         ) {
+          setPendingTaskId(data.taskId)
           setError("生成接近超时，正在恢复上游任务…")
           const url = await resumeTask(data.taskId)
           if (url) {
+            setPendingTaskId(null)
             setError(null)
             applyImageUrl(url)
             return
@@ -99,13 +143,15 @@ export default function HomePage() {
         return
       }
 
+      setPendingTaskId(null)
       applyImageUrl(data.url)
     } catch (err) {
+      // pendingTaskId remains set when resume/network failed after task creation.
       setError(err instanceof Error ? err.message : "网络错误，请重试")
     } finally {
       setLoading(false)
     }
-  }, [applyImageUrl, customPrompt, resumeTask, theme, text])
+  }, [applyImageUrl, customPrompt, pendingTaskId, resumeTask, theme, text])
 
   const download = useCallback(() => {
     if (!selected) return
