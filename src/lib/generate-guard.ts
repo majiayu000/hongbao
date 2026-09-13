@@ -61,9 +61,11 @@ function fingerprint(value: string): string {
  * to the number of trusted proxies that append to X-Forwarded-For; the client
  * address is taken at index (length - hops).
  *
- * When no trusted address is available, fall back to a stable fingerprint of
- * the session cookie or access token so distinct authenticated callers do not
- * collapse into one shared "unknown" bucket.
+ * When no trusted address is available, fall back to a stable fingerprint of a
+ * *verified* session cookie or the presented access token so distinct
+ * authenticated callers do not collapse into one shared bucket. Unverified
+ * cookie values are ignored — otherwise a bearer-authenticated caller could
+ * rotate arbitrary `generate_session` cookies to mint fresh quota buckets.
  */
 export function getClientIp(req: NextRequest): string {
   const hops = parseNonNegativeInt(process.env.GENERATE_TRUSTED_PROXY_HOPS, 0)
@@ -81,9 +83,10 @@ export function getClientIp(req: NextRequest): string {
     }
   }
 
-  const cookie = req.cookies.get(SESSION_COOKIE)?.value?.trim()
-  if (cookie) {
-    return `sess:${fingerprint(cookie)}`
+  const secret = process.env.GENERATE_ACCESS_TOKEN?.trim()
+  const cookie = req.cookies.get(SESSION_COOKIE)?.value
+  if (secret && cookie && verifySessionCookie(cookie, secret)) {
+    return `sess:${fingerprint(cookie.trim())}`
   }
 
   const token = extractAccessToken(req)
