@@ -58,13 +58,14 @@ cp env.example .env.local
 # - GENERATE_ACCESS_TOKEN：服务端共享密钥（必填；不要使用 NEXT_PUBLIC_ 前缀）
 # - 多实例/serverless：配置 Upstash Redis，并建议开启 GENERATE_REQUIRE_SHARED_QUOTA=1
 # - 反代部署：设置 GENERATE_TRUSTED_PROXY_HOPS 为可信代理层数（按 IP 配额）
-# - 无反代时默认忽略客户端 XFF，改用会话/令牌指纹作为配额键（避免全站共用一个桶）
+# - 无反代时默认忽略客户端 XFF，对所有已通过鉴权的调用统一使用全局配额桶
+#   （会话可反复签发、访问令牌为共享密钥，二者都不能作为稳定的 per-caller 身份）
 ```
 
 `POST /api/generate` 在调用 AtlasCloud 之前会：
 
 1. 校验访问：`Authorization: Bearer …` / `x-generate-token`，或由 `POST /api/auth` 签发的 **httpOnly** 会话 cookie（失败 → 401）
-2. 按可信客户端 IP（或会话/令牌指纹）做突发限流与每日配额（超限 → 429）；生产多实例请用 Redis 共享存储
+2. 按可信客户端 IP（或无反代时的显式全局认证配额）做突发限流与每日配额（超限 → 429）；生产多实例请用 Redis 共享存储
 
 Web UI 解锁时由用户粘贴令牌换取会话 cookie，**密钥不会打进前端 JS 包**。
 

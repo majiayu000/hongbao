@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "crypto"
+import { createHmac, timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 /** Sliding-window burst limit (requests per window). */
@@ -49,23 +49,21 @@ export function accessTokensMatch(provided: string, expected: string): boolean {
   return safeEqual(provided, expected)
 }
 
-function fingerprint(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 32)
-}
-
 /**
- * Quota subject key (trusted client IP when configured, else auth identity).
+ * Quota subject key.
  *
- * By default ignores client-controlled forwarding headers so callers cannot
- * rotate X-Forwarded-For to mint fresh buckets. Set GENERATE_TRUSTED_PROXY_HOPS
- * to the number of trusted proxies that append to X-Forwarded-For; the client
- * address is taken at index (length - hops).
+ * Preferred: trusted client IP via GENERATE_TRUSTED_PROXY_HOPS. By default
+ * (hops=0) client-controlled X-Forwarded-For is ignored so callers cannot
+ * rotate that header to mint fresh buckets.
  *
- * When no trusted address is available, fall back to a stable fingerprint of a
- * *verified* session cookie or the presented access token so distinct
- * authenticated callers do not collapse into one shared bucket. Unverified
- * cookie values are ignored — otherwise a bearer-authenticated caller could
- * rotate arbitrary `generate_session` cookies to mint fresh quota buckets.
+ * When no trusted address is available, quotas use a single explicit
+ * `global:authenticated` bucket for every caller that already passed
+ * assertGenerateAccess. Session cookies are remintable via POST /api/auth
+ * (new signed timestamps), and GENERATE_ACCESS_TOKEN is one shared secret for
+ * all bearer / x-generate-token clients — neither is a stable per-caller
+ * identity. Global mode prevents reminting or shared-token exhaustion from
+ * looking like independent per-caller budgets; set trusted proxy hops for
+ * true per-IP isolation.
  */
 export function getClientIp(req: NextRequest): string {
   const hops = parseNonNegativeInt(process.env.GENERATE_TRUSTED_PROXY_HOPS, 0)
@@ -83,19 +81,8 @@ export function getClientIp(req: NextRequest): string {
     }
   }
 
-  const secret = process.env.GENERATE_ACCESS_TOKEN?.trim()
-  const cookie = req.cookies.get(SESSION_COOKIE)?.value
-  if (secret && cookie && verifySessionCookie(cookie, secret)) {
-    return `sess:${fingerprint(cookie.trim())}`
-  }
-
-  const token = extractAccessToken(req)
-  if (token) {
-    return `tok:${fingerprint(token)}`
-  }
-
-  // Unreachable after assertGenerateAccess; keep distinct from any shared sentinel.
-  return `unauth:${fingerprint(req.headers.get("user-agent") ?? "missing")}`
+  // Explicit global limit for authenticated traffic without a trusted IP.
+  return "global:authenticated"
 }
 
 /**
@@ -379,7 +366,7 @@ function assertQuotaMemory(
 }
 
 /**
- * Per-IP burst rate limit + daily quota.
+ * Burst rate limit + daily quota keyed by getClientIp (trusted IP or global).
  * Prefer Redis (GENERATE_QUOTA_REDIS_URL + TOKEN / Upstash) for multi-instance.
  * Call only after auth succeeds so anonymous traffic cannot fill buckets.
  */
