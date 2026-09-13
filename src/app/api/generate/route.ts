@@ -5,7 +5,8 @@ const MAX_POLL_TIME = 120_000
 
 export async function POST(req: NextRequest) {
   const contentType = req.headers.get("content-type") ?? ""
-  if (!contentType.toLowerCase().includes("application/json")) {
+  const mediaType = contentType.split(";", 1)[0].trim().toLowerCase()
+  if (mediaType !== "application/json") {
     return NextResponse.json({ error: "invalid json" }, { status: 400 })
   }
 
