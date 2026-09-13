@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "crypto"
+import { createHash, createHmac, timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 /** Sliding-window burst limit (requests per window). */
@@ -49,33 +49,50 @@ export function accessTokensMatch(provided: string, expected: string): boolean {
   return safeEqual(provided, expected)
 }
 
+function fingerprint(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32)
+}
+
 /**
- * Client IP for quota keys.
+ * Quota subject key (trusted client IP when configured, else auth identity).
  *
  * By default ignores client-controlled forwarding headers so callers cannot
  * rotate X-Forwarded-For to mint fresh buckets. Set GENERATE_TRUSTED_PROXY_HOPS
  * to the number of trusted proxies that append to X-Forwarded-For; the client
  * address is taken at index (length - hops).
+ *
+ * When no trusted address is available, fall back to a stable fingerprint of
+ * the session cookie or access token so distinct authenticated callers do not
+ * collapse into one shared "unknown" bucket.
  */
 export function getClientIp(req: NextRequest): string {
   const hops = parseNonNegativeInt(process.env.GENERATE_TRUSTED_PROXY_HOPS, 0)
-  if (hops <= 0) {
-    return "unknown"
-  }
-
-  const forwarded = req.headers.get("x-forwarded-for")
-  if (forwarded) {
-    const parts = forwarded
-      .split(",")
-      .map((part) => part.trim())
-      .filter(Boolean)
-    const idx = parts.length - hops
-    if (idx >= 0 && parts[idx]) {
-      return parts[idx]
+  if (hops > 0) {
+    const forwarded = req.headers.get("x-forwarded-for")
+    if (forwarded) {
+      const parts = forwarded
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+      const idx = parts.length - hops
+      if (idx >= 0 && parts[idx]) {
+        return parts[idx]
+      }
     }
   }
 
-  return "unknown"
+  const cookie = req.cookies.get(SESSION_COOKIE)?.value?.trim()
+  if (cookie) {
+    return `sess:${fingerprint(cookie)}`
+  }
+
+  const token = extractAccessToken(req)
+  if (token) {
+    return `tok:${fingerprint(token)}`
+  }
+
+  // Unreachable after assertGenerateAccess; keep distinct from any shared sentinel.
+  return `unauth:${fingerprint(req.headers.get("user-agent") ?? "missing")}`
 }
 
 /**
@@ -198,8 +215,18 @@ async function redisCommand(
   return payload.result
 }
 
-function evictIdleBuckets(now: number, ttlMs: number): void {
+/**
+ * Drop idle buckets only when their burst/daily counters no longer apply.
+ * A short GENERATE_BUCKET_TTL_MS must not wipe in-horizon state and reset quotas.
+ */
+function evictIdleBuckets(now: number, ttlMs: number, rateWindowMs: number): void {
+  const day = todayKey(now)
   for (const [key, bucket] of buckets) {
+    const hasBurstState = bucket.hits.some((t) => now - t < rateWindowMs)
+    const hasDailyState = bucket.day === day && bucket.dayCount > 0
+    if (hasBurstState || hasDailyState) {
+      continue
+    }
     if (now - bucket.lastSeen > ttlMs) {
       buckets.delete(key)
     }
@@ -302,11 +329,18 @@ function assertQuotaMemory(
 ): NextResponse | null {
   const now = Date.now()
   const day = todayKey(now)
-  const ttlMs = parsePositiveInt(
+  const configuredTtlMs = parsePositiveInt(
     process.env.GENERATE_BUCKET_TTL_MS,
     DEFAULT_BUCKET_TTL_MS
   )
-  evictIdleBuckets(now, ttlMs)
+  // Keep empty buckets at least through the longer of the burst window and
+  // the remainder of the UTC day so TTL cannot undercut enforcement horizons.
+  const msUntilEndOfUtcDay = Math.max(
+    Date.parse(`${day}T23:59:59.999Z`) - now + 1,
+    0
+  )
+  const ttlMs = Math.max(configuredTtlMs, rateWindowMs, msUntilEndOfUtcDay)
+  evictIdleBuckets(now, ttlMs, rateWindowMs)
 
   let bucket = buckets.get(ip)
   if (!bucket) {
