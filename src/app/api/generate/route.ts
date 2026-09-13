@@ -22,12 +22,14 @@ export async function POST(req: NextRequest) {
     )
   }
 
+  // Async create returns a task id promptly; sync mode can hang past the
+  // deadline and leave 504s unrecoverable without a taskId.
   const body: Record<string, unknown> = {
     model,
     prompt,
     aspect_ratio: "3:4",
     output_format: "png",
-    enable_sync_mode: true,
+    enable_sync_mode: false,
   }
 
   const clientSignal = req.signal
@@ -67,8 +69,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ url: imageUrl })
     }
 
-    // 如果同步模式未生效，回退到轮询
-    taskId = typeof data.id === "string" ? data.id : undefined
+    // Prefer an immediate image if the provider still returns one.
+    // Otherwise require a well-formed task id before any authenticated poll URL.
+    taskId = parseTaskId(typeof data.id === "string" ? data.id : undefined)
     if (!taskId) {
       console.error("Unexpected API response:", JSON.stringify(raw))
       return NextResponse.json(
@@ -99,8 +102,9 @@ export async function POST(req: NextRequest) {
 
 /** Resume an upstream prediction that may still be running after a 504. */
 export async function GET(req: NextRequest) {
-  const taskId = req.nextUrl.searchParams.get("taskId")
-  if (!taskId || taskId.length > 200) {
+  const rawTaskId = req.nextUrl.searchParams.get("taskId")
+  const taskId = parseTaskId(rawTaskId)
+  if (!taskId) {
     return NextResponse.json({ error: "invalid taskId" }, { status: 400 })
   }
 
@@ -152,7 +156,7 @@ async function pollForResult(
 
     await sleep(POLL_INTERVAL, signal)
 
-    const pollRes = await fetch(`${apiBase}/model/prediction/${taskId}`, {
+    const pollRes = await fetch(predictionUrl(apiBase, taskId), {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal,
     })
@@ -193,6 +197,24 @@ async function pollForResult(
   }
 
   return timeoutResponse(taskId)
+}
+
+
+/** Safe prediction path segment: reject traversal / alternate endpoints. */
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+function parseTaskId(value: string | null | undefined): string | undefined {
+  if (!value) return undefined
+  if (!TASK_ID_RE.test(value)) return undefined
+  if (value.includes("..") || value.includes("/") || value.includes("\\")) {
+    return undefined
+  }
+  return value
+}
+
+function predictionUrl(apiBase: string, taskId: string): string {
+  // encodeURIComponent keeps the id a single path segment even if charset grows.
+  return `${apiBase}/model/prediction/${encodeURIComponent(taskId)}`
 }
 
 function timeoutResponse(taskId?: string) {
