@@ -20,13 +20,19 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  let body: { token?: unknown }
+  let parsed: unknown
   try {
-    body = await req.json()
+    parsed = await req.json()
   } catch {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 })
   }
 
+  // Reject JSON null / non-objects before dereferencing `.token` (avoids 500).
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return NextResponse.json({ error: "invalid JSON" }, { status: 400 })
+  }
+
+  const body = parsed as { token?: unknown }
   const token = typeof body.token === "string" ? body.token.trim() : ""
   if (!token || !accessTokensMatch(token, expected)) {
     return NextResponse.json({ error: "令牌无效" }, { status: 401 })
