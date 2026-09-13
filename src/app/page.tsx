@@ -68,12 +68,14 @@ export default function HomePage() {
         continue
       }
 
-      // Terminal API response — do not create a new task; surface the error.
-      throw new Error(
+      // Terminal API response — clear pending ID so later Generate can create a new task.
+      const terminal = new Error(
         typeof data.error === "string" && data.error.length > 0
           ? data.error
           : "恢复生成任务失败"
-      )
+      ) as Error & { terminal?: boolean }
+      terminal.terminal = true
+      throw terminal
     }
     return null
   }, [])
@@ -146,7 +148,14 @@ export default function HomePage() {
       setPendingTaskId(null)
       applyImageUrl(data.url)
     } catch (err) {
-      // pendingTaskId remains set when resume/network failed after task creation.
+      // Keep pendingTaskId for transient resume/network failures so retry can resume.
+      // Clear it for terminal prediction errors (failed/canceled/empty-complete/permanent 4xx).
+      if (
+        err instanceof Error &&
+        (err as Error & { terminal?: boolean }).terminal === true
+      ) {
+        setPendingTaskId(null)
+      }
       setError(err instanceof Error ? err.message : "网络错误，请重试")
     } finally {
       setLoading(false)

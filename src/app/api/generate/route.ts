@@ -177,13 +177,15 @@ async function pollForResult(
 
     if (!pollRes.ok) {
       // Rate limits / request timeouts are transient: keep polling within budget.
-      // Other 4xx after create must not drop taskId — page resume only handles
-      // 504+taskId, so return the recoverable timeout payload instead of bare 4xx.
       if (pollRes.status === 429 || pollRes.status === 408) {
         continue
       }
+      // Permanent 4xx (401/403/expired 404/etc.) must not look like a still-running 504.
       if (pollRes.status >= 400 && pollRes.status < 500) {
-        return timeoutResponse(taskId)
+        return NextResponse.json(
+          { error: `API error: ${pollRes.status} ${pollRes.statusText}` },
+          { status: pollRes.status }
+        )
       }
       continue
     }
