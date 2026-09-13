@@ -64,7 +64,8 @@ export default function HomePage() {
         return data.url
       }
 
-      if (res.status === 504 && typeof data.taskId === "string" && data.taskId) {
+      // Gateway JSON 504 may omit taskId; resumeTask already holds the local ID.
+      if (res.status === 504) {
         continue
       }
 
