@@ -4,7 +4,22 @@ const POLL_INTERVAL = 2000
 const MAX_POLL_TIME = 120_000
 
 export async function POST(req: NextRequest) {
-  const { prompt } = await req.json()
+  const contentType = req.headers.get("content-type") ?? ""
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return NextResponse.json({ error: "invalid json" }, { status: 400 })
+  }
+
+  let bodyJson: unknown
+  try {
+    bodyJson = await req.json()
+  } catch {
+    return NextResponse.json({ error: "invalid json" }, { status: 400 })
+  }
+
+  const prompt =
+    bodyJson && typeof bodyJson === "object" && !Array.isArray(bodyJson)
+      ? (bodyJson as { prompt?: unknown }).prompt
+      : undefined
 
   if (!prompt || typeof prompt !== "string" || prompt.length > 2000) {
     return NextResponse.json({ error: "invalid prompt" }, { status: 400 })
