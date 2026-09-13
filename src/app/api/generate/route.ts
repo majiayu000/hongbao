@@ -30,8 +30,10 @@ export async function POST(req: NextRequest) {
     enable_sync_mode: true,
   }
 
-  const signal = req.signal
+  const clientSignal = req.signal
+  const { signal, cleanup } = composeDeadlineSignal(clientSignal, MAX_SERVER_WAIT_MS)
   const startedAt = Date.now()
+  let taskId: string | undefined
 
   try {
     const res = await fetch(`${apiBase}/model/generateImage`, {
@@ -66,7 +68,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 如果同步模式未生效，回退到轮询
-    const taskId = data.id as string | undefined
+    taskId = typeof data.id === "string" ? data.id : undefined
     if (!taskId) {
       console.error("Unexpected API response:", JSON.stringify(raw))
       return NextResponse.json(
@@ -79,14 +81,58 @@ export async function POST(req: NextRequest) {
     const pollBudgetMs = Math.max(0, MAX_SERVER_WAIT_MS - elapsed)
     return await pollForResult(apiBase, apiKey, taskId, pollBudgetMs, signal)
   } catch (err) {
-    if (isAbortError(err) || signal.aborted) {
-      return new NextResponse(null, { status: 499 })
+    if (isAbortError(err) || signal.aborted || clientSignal.aborted) {
+      if (clientSignal.aborted) {
+        return new NextResponse(null, { status: 499 })
+      }
+      return timeoutResponse(taskId)
     }
     console.error("Generate image error:", err)
     return NextResponse.json(
       { error: "网络错误，请重试" },
       { status: 500 }
     )
+  } finally {
+    cleanup()
+  }
+}
+
+/** Resume an upstream prediction that may still be running after a 504. */
+export async function GET(req: NextRequest) {
+  const taskId = req.nextUrl.searchParams.get("taskId")
+  if (!taskId || taskId.length > 200) {
+    return NextResponse.json({ error: "invalid taskId" }, { status: 400 })
+  }
+
+  const apiKey = process.env.AI_IMAGE_API_KEY
+  const apiBase = process.env.AI_IMAGE_API_BASE || "https://api.atlascloud.ai/api/v1"
+
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: "未配置 AI_IMAGE_API_KEY 环境变量" },
+      { status: 500 }
+    )
+  }
+
+  const clientSignal = req.signal
+  const { signal, cleanup } = composeDeadlineSignal(clientSignal, MAX_SERVER_WAIT_MS)
+
+  try {
+    return await pollForResult(apiBase, apiKey, taskId, MAX_SERVER_WAIT_MS, signal)
+  } catch (err) {
+    if (isAbortError(err) || signal.aborted || clientSignal.aborted) {
+      if (clientSignal.aborted) {
+        return new NextResponse(null, { status: 499 })
+      }
+      return timeoutResponse(taskId)
+    }
+    console.error("Resume prediction error:", err)
+    return NextResponse.json(
+      { error: "网络错误，请重试" },
+      { status: 500 }
+    )
+  } finally {
+    cleanup()
   }
 }
 
@@ -100,6 +146,10 @@ async function pollForResult(
   const startTime = Date.now()
 
   while (Date.now() - startTime < maxPollTimeMs) {
+    if (signal.aborted) {
+      throw new DOMException("Aborted", "AbortError")
+    }
+
     await sleep(POLL_INTERVAL, signal)
 
     const pollRes = await fetch(`${apiBase}/model/prediction/${taskId}`, {
@@ -142,15 +192,57 @@ async function pollForResult(
     }
   }
 
+  return timeoutResponse(taskId)
+}
+
+function timeoutResponse(taskId?: string) {
   return NextResponse.json(
     {
       error:
         "AI 图片生成超时（服务端等待上限约 45 秒），请稍后重试。上游任务可能仍在处理中。",
       retry: true,
-      taskId,
+      ...(taskId ? { taskId } : {}),
     },
     { status: 504 }
   )
+}
+
+/**
+ * Abort when the client disconnects OR the server deadline expires, so hung
+ * upstream fetches cannot outlive MAX_SERVER_WAIT_MS.
+ */
+function composeDeadlineSignal(
+  clientSignal: AbortSignal,
+  deadlineMs: number
+): { signal: AbortSignal; cleanup: () => void } {
+  if (
+    typeof AbortSignal.any === "function" &&
+    typeof AbortSignal.timeout === "function"
+  ) {
+    return {
+      signal: AbortSignal.any([clientSignal, AbortSignal.timeout(deadlineMs)]),
+      cleanup: () => {},
+    }
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), deadlineMs)
+  const onClientAbort = () => controller.abort()
+
+  if (clientSignal.aborted) {
+    clearTimeout(timer)
+    controller.abort()
+  } else {
+    clientSignal.addEventListener("abort", onClientAbort, { once: true })
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer)
+      clientSignal.removeEventListener("abort", onClientAbort)
+    },
+  }
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -174,7 +266,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 function isAbortError(err: unknown): boolean {
   return (
     (err instanceof DOMException && err.name === "AbortError") ||
-    (err instanceof Error && err.name === "AbortError")
+    (err instanceof Error && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "TimeoutError")
   )
 }
 

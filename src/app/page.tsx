@@ -21,6 +21,35 @@ export default function HomePage() {
     setText(t.defaultText)
   }
 
+  const applyImageUrl = useCallback((url: string) => {
+    setImages((prev) => [url, ...prev])
+    setSelected(url)
+  }, [])
+
+  /** Resume a timed-out upstream task via short GET polls (each under gateway limit). */
+  const resumeTask = useCallback(async (taskId: string): Promise<string | null> => {
+    const maxAttempts = 4
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const res = await fetch(`/api/generate?taskId=${encodeURIComponent(taskId)}`)
+      const data = await res.json()
+
+      if (res.ok && typeof data.url === "string" && data.url) {
+        return data.url
+      }
+
+      if (res.status === 504 && typeof data.taskId === "string" && data.taskId) {
+        continue
+      }
+
+      throw new Error(
+        typeof data.error === "string" && data.error.length > 0
+          ? data.error
+          : "恢复生成任务失败"
+      )
+    }
+    return null
+  }, [])
+
   const generate = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -36,7 +65,27 @@ export default function HomePage() {
       const data = await res.json()
 
       if (!res.ok) {
-        // Keep sync {url} success contract; show API retry guidance on 504.
+        // On 504 with taskId, resume the same upstream job instead of discarding it.
+        if (
+          res.status === 504 &&
+          typeof data.taskId === "string" &&
+          data.taskId.length > 0
+        ) {
+          setError("生成接近超时，正在恢复上游任务…")
+          const url = await resumeTask(data.taskId)
+          if (url) {
+            setError(null)
+            applyImageUrl(url)
+            return
+          }
+          setError(
+            typeof data.error === "string" && data.error.length > 0
+              ? data.error
+              : "生成超时，请稍后重试"
+          )
+          return
+        }
+
         setError(
           typeof data.error === "string" && data.error.length > 0
             ? data.error
@@ -50,14 +99,13 @@ export default function HomePage() {
         return
       }
 
-      setImages((prev) => [data.url, ...prev])
-      setSelected(data.url)
-    } catch {
-      setError("网络错误，请重试")
+      applyImageUrl(data.url)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "网络错误，请重试")
     } finally {
       setLoading(false)
     }
-  }, [customPrompt, theme, text])
+  }, [applyImageUrl, customPrompt, resumeTask, theme, text])
 
   const download = useCallback(() => {
     if (!selected) return
