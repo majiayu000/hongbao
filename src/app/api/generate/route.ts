@@ -80,9 +80,12 @@ export async function POST(req: NextRequest) {
       )
     }
 
+    const urls = data.urls as { get?: unknown } | undefined
+    const pollUrl = resolvePollUrl(apiBase, taskId, urls?.get)
+
     const elapsed = Date.now() - startedAt
     const pollBudgetMs = Math.max(0, MAX_SERVER_WAIT_MS - elapsed)
-    return await pollForResult(apiBase, apiKey, taskId, pollBudgetMs, signal)
+    return await pollForResult(apiBase, apiKey, taskId, pollBudgetMs, signal, pollUrl)
   } catch (err) {
     if (isAbortError(err) || signal.aborted || clientSignal.aborted) {
       if (clientSignal.aborted) {
@@ -122,7 +125,14 @@ export async function GET(req: NextRequest) {
   const { signal, cleanup } = composeDeadlineSignal(clientSignal, MAX_SERVER_WAIT_MS)
 
   try {
-    return await pollForResult(apiBase, apiKey, taskId, MAX_SERVER_WAIT_MS, signal)
+    return await pollForResult(
+      apiBase,
+      apiKey,
+      taskId,
+      MAX_SERVER_WAIT_MS,
+      signal,
+      predictionUrl(apiBase, taskId)
+    )
   } catch (err) {
     if (isAbortError(err) || signal.aborted || clientSignal.aborted) {
       if (clientSignal.aborted) {
@@ -145,7 +155,8 @@ async function pollForResult(
   apiKey: string,
   taskId: string,
   maxPollTimeMs: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  pollUrl: string = predictionUrl(apiBase, taskId)
 ) {
   const startTime = Date.now()
 
@@ -156,7 +167,7 @@ async function pollForResult(
 
     await sleep(POLL_INTERVAL, signal)
 
-    const pollRes = await fetch(predictionUrl(apiBase, taskId), {
+    const pollRes = await fetch(pollUrl, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal,
     })
@@ -188,9 +199,10 @@ async function pollForResult(
       )
     }
 
-    if (status === "failed" || status === "error") {
+    // AtlasCloud terminal failures include canceled (see scripts/gen_anime_covers.py).
+    if (status === "failed" || status === "error" || status === "canceled") {
       return NextResponse.json(
-        { error: `AI 图片生成失败: ${pollData.error || "未知错误"}` },
+        { error: `AI 图片生成失败: ${pollData.error || status}` },
         { status: 500 }
       )
     }
@@ -213,8 +225,39 @@ function parseTaskId(value: string | null | undefined): string | undefined {
 }
 
 function predictionUrl(apiBase: string, taskId: string): string {
+  // AtlasCloud async contract: GET /api/v1/predictions/{id} (not /model/prediction/).
   // encodeURIComponent keeps the id a single path segment even if charset grows.
-  return `${apiBase}/model/prediction/${encodeURIComponent(taskId)}`
+  return `${apiBase}/predictions/${encodeURIComponent(taskId)}`
+}
+
+/**
+ * Prefer provider-returned urls.get when it matches the documented predictions
+ * path for this taskId; otherwise construct the safe documented URL.
+ */
+function resolvePollUrl(
+  apiBase: string,
+  taskId: string,
+  urlsGet: unknown
+): string {
+  const fallback = predictionUrl(apiBase, taskId)
+  if (typeof urlsGet !== "string" || !urlsGet) return fallback
+
+  try {
+    const base = new URL(apiBase.endsWith("/") ? apiBase : `${apiBase}/`)
+    const poll = new URL(urlsGet)
+    if (poll.origin !== base.origin) return fallback
+
+    const expectedPath = new URL(
+      `predictions/${encodeURIComponent(taskId)}`,
+      base
+    ).pathname
+    if (poll.pathname !== expectedPath) return fallback
+    if (poll.username || poll.password) return fallback
+
+    return poll.toString()
+  } catch {
+    return fallback
+  }
 }
 
 function timeoutResponse(taskId?: string) {
