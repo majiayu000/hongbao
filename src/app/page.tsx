@@ -84,7 +84,12 @@ export default function HomePage() {
       const data = await res.json()
 
       if (!res.ok) {
-        if (res.status === 401) {
+        // Only clear the local unlock UI for server-marked session/auth expiry.
+        // Upstream AtlasCloud 401s are mapped to 502 and must not lock the UI.
+        if (
+          res.status === 401 &&
+          (data.code === "local_auth_required" || !data.code)
+        ) {
           setUnlocked(false)
         }
         setError(data.error)

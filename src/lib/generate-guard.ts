@@ -153,7 +153,10 @@ export function assertGenerateAccess(req: NextRequest): NextResponse | null {
   }
 
   return NextResponse.json(
-    { error: "未授权：需要有效的生成访问令牌或已解锁会话" },
+    {
+      error: "未授权：需要有效的生成访问令牌或已解锁会话",
+      code: "local_auth_required",
+    },
     { status: 401 }
   )
 }
@@ -203,6 +206,44 @@ function evictIdleBuckets(now: number, ttlMs: number): void {
   }
 }
 
+/**
+ * Atomically prune → count → check → insert burst hits and bump the daily
+ * counter so concurrent same-IP requests cannot race past the burst limit.
+ */
+const QUOTA_LUA = `
+local burstKey = KEYS[1]
+local dayKey = KEYS[2]
+local now = tonumber(ARGV[1])
+local windowStart = tonumber(ARGV[2])
+local rateLimit = tonumber(ARGV[3])
+local dailyQuota = tonumber(ARGV[4])
+local member = ARGV[5]
+local burstTtl = tonumber(ARGV[6])
+local dayTtl = tonumber(ARGV[7])
+
+redis.call('ZREMRANGEBYSCORE', burstKey, 0, windowStart)
+local burstCount = redis.call('ZCARD', burstKey)
+if burstCount >= rateLimit then
+  return {'burst'}
+end
+
+local dayCount = tonumber(redis.call('GET', dayKey) or '0')
+if dayCount >= dailyQuota then
+  return {'daily'}
+end
+
+redis.call('ZADD', burstKey, now, member)
+redis.call('PEXPIRE', burstKey, burstTtl)
+local nextDay = redis.call('INCR', dayKey)
+if nextDay == 1 then
+  redis.call('PEXPIRE', dayKey, dayTtl)
+end
+if nextDay > dailyQuota then
+  return {'daily'}
+end
+return {'ok'}
+`
+
 async function assertQuotaRedis(
   ip: string,
   rateLimit: number,
@@ -216,42 +257,34 @@ async function assertQuotaRedis(
   const dayKey = `hongbao:gen:day:${day}:${ip}`
   const member = `${now}:${Math.random().toString(36).slice(2, 10)}`
   const windowStart = now - rateWindowMs
+  const burstTtl = Math.max(rateWindowMs, 1000)
+  // Expire shortly after UTC day end.
+  const endOfDayMs = Date.parse(`${day}T23:59:59.999Z`) - now + 60_000
+  const dayTtl = Math.max(endOfDayMs, 60_000)
 
-  await redisCommand(cfg, ["ZREMRANGEBYSCORE", burstKey, 0, windowStart])
-  const burstCount = Number(await redisCommand(cfg, ["ZCARD", burstKey]))
-  if (burstCount >= rateLimit) {
+  const result = await redisCommand(cfg, [
+    "EVAL",
+    QUOTA_LUA,
+    2,
+    burstKey,
+    dayKey,
+    now,
+    windowStart,
+    rateLimit,
+    dailyQuota,
+    member,
+    burstTtl,
+    dayTtl,
+  ])
+
+  const verdict = Array.isArray(result) ? String(result[0] ?? "") : String(result ?? "")
+  if (verdict === "burst") {
     return NextResponse.json(
       { error: "请求过于频繁，请稍后再试" },
       { status: 429 }
     )
   }
-
-  const dayCount = Number((await redisCommand(cfg, ["GET", dayKey])) ?? 0)
-  if (dayCount >= dailyQuota) {
-    return NextResponse.json(
-      { error: "今日生成次数已达上限" },
-      { status: 429 }
-    )
-  }
-
-  await redisCommand(cfg, ["ZADD", burstKey, now, member])
-  await redisCommand(cfg, [
-    "PEXPIRE",
-    burstKey,
-    Math.max(rateWindowMs, 1000),
-  ])
-  const nextDay = Number(await redisCommand(cfg, ["INCR", dayKey]))
-  if (nextDay === 1) {
-    // Expire shortly after UTC day end.
-    const endOfDayMs =
-      Date.parse(`${day}T23:59:59.999Z`) - now + 60_000
-    await redisCommand(cfg, [
-      "PEXPIRE",
-      dayKey,
-      Math.max(endOfDayMs, 60_000),
-    ])
-  }
-  if (nextDay > dailyQuota) {
+  if (verdict === "daily") {
     return NextResponse.json(
       { error: "今日生成次数已达上限" },
       { status: 429 }
@@ -276,9 +309,14 @@ function assertQuotaMemory(
   evictIdleBuckets(now, ttlMs)
 
   let bucket = buckets.get(ip)
-  if (!bucket || bucket.day !== day) {
+  if (!bucket) {
     bucket = { hits: [], day, dayCount: 0, lastSeen: now }
     buckets.set(ip, bucket)
+  } else if (bucket.day !== day) {
+    // New UTC day: reset daily count but keep in-window burst hits so a
+    // midnight boundary cannot grant a second full burst allowance.
+    bucket.day = day
+    bucket.dayCount = 0
   }
 
   bucket.lastSeen = now

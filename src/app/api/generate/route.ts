@@ -53,9 +53,15 @@ export async function POST(req: NextRequest) {
     if (!res.ok) {
       const errText = await res.text()
       console.error("AI image API error:", errText)
+      // Do not forward upstream 401 as local session expiry; map auth
+      // failures from AtlasCloud to a gateway status instead.
+      const status = res.status === 401 || res.status === 403 ? 502 : res.status
       return NextResponse.json(
-        { error: `AI 图片生成失败: ${res.status}` },
-        { status: res.status }
+        {
+          error: `AI 图片生成失败: ${res.status}`,
+          code: "upstream_error",
+        },
+        { status }
       )
     }
 
@@ -103,9 +109,14 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
 
     if (!pollRes.ok) {
       if (pollRes.status >= 400 && pollRes.status < 500) {
+        const status =
+          pollRes.status === 401 || pollRes.status === 403 ? 502 : pollRes.status
         return NextResponse.json(
-          { error: `API error: ${pollRes.status} ${pollRes.statusText}` },
-          { status: pollRes.status }
+          {
+            error: `API error: ${pollRes.status} ${pollRes.statusText}`,
+            code: "upstream_error",
+          },
+          { status }
         )
       }
       continue
