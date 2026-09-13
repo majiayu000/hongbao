@@ -36,7 +36,17 @@ export default function HomePage() {
       const data = await res.json()
 
       if (!res.ok) {
-        setError(data.error)
+        // Keep sync {url} success contract; show API retry guidance on 504.
+        setError(
+          typeof data.error === "string" && data.error.length > 0
+            ? data.error
+            : "生成失败，请重试"
+        )
+        return
+      }
+
+      if (typeof data.url !== "string" || !data.url) {
+        setError("AI 返回数据中无图片 URL")
         return
       }
 

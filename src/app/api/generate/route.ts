@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server"
 
 const POLL_INTERVAL = 2000
-const MAX_POLL_TIME = 120_000
+/** Cap total server-side wait under common ~60s gateway limits. */
+const MAX_SERVER_WAIT_MS = 45_000
 
 export async function POST(req: NextRequest) {
   const { prompt } = await req.json()
@@ -29,6 +30,9 @@ export async function POST(req: NextRequest) {
     enable_sync_mode: true,
   }
 
+  const signal = req.signal
+  const startedAt = Date.now()
+
   try {
     const res = await fetch(`${apiBase}/model/generateImage`, {
       method: "POST",
@@ -37,6 +41,7 @@ export async function POST(req: NextRequest) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
+      signal,
     })
 
     if (!res.ok) {
@@ -70,8 +75,13 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    return await pollForResult(apiBase, apiKey, taskId)
+    const elapsed = Date.now() - startedAt
+    const pollBudgetMs = Math.max(0, MAX_SERVER_WAIT_MS - elapsed)
+    return await pollForResult(apiBase, apiKey, taskId, pollBudgetMs, signal)
   } catch (err) {
+    if (isAbortError(err) || signal.aborted) {
+      return new NextResponse(null, { status: 499 })
+    }
     console.error("Generate image error:", err)
     return NextResponse.json(
       { error: "网络错误，请重试" },
@@ -80,14 +90,21 @@ export async function POST(req: NextRequest) {
   }
 }
 
-async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
+async function pollForResult(
+  apiBase: string,
+  apiKey: string,
+  taskId: string,
+  maxPollTimeMs: number,
+  signal: AbortSignal
+) {
   const startTime = Date.now()
 
-  while (Date.now() - startTime < MAX_POLL_TIME) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL))
+  while (Date.now() - startTime < maxPollTimeMs) {
+    await sleep(POLL_INTERVAL, signal)
 
     const pollRes = await fetch(`${apiBase}/model/prediction/${taskId}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      signal,
     })
 
     if (!pollRes.ok) {
@@ -126,8 +143,38 @@ async function pollForResult(apiBase: string, apiKey: string, taskId: string) {
   }
 
   return NextResponse.json(
-    { error: "AI 图片生成超时，请重试" },
+    {
+      error:
+        "AI 图片生成超时（服务端等待上限约 45 秒），请稍后重试。上游任务可能仍在处理中。",
+      retry: true,
+      taskId,
+    },
     { status: 504 }
+  )
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException("Aborted", "AbortError"))
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
   )
 }
 
